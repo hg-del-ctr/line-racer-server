@@ -1,0 +1,12 @@
+{
+  "name": "line-racer-matchmaker",
+  "version": "1.0.0",
+  "description": "WebRTC matchmaking and signaling server for Line Racer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
