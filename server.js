@@ -4,10 +4,12 @@ const PORT = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port: PORT });
 
 let waitingQueue = [];
+let queueTimer = null;
+let queueCountdown = 0;
+
 let nextPeerId = 1;
 let nextRoomId = 1;
 
-// Active match rooms stored by ID
 const rooms = new Map();
 
 console.log(`Matchmaking & Signaling server running on port ${PORT}`);
@@ -15,11 +17,10 @@ console.log(`Matchmaking & Signaling server running on port ${PORT}`);
 wss.on("connection", (ws) => {
   ws.peerId = nextPeerId++;
   ws.room = null;
-  ws.partner = null;
-  ws.isHost = false;
+  ws.meshId = 0; // 1 = Host, 2..4 = Clients
   ws.playerName = `Player ${ws.peerId}`;
 
-  console.log(`Player connected. Assigned ID: ${ws.peerId}`);
+  console.log(`Player connected. Assigned Server ID: ${ws.peerId}`);
 
   ws.on("message", (rawMessage) => {
     let msg;
@@ -36,12 +37,19 @@ wss.on("connection", (ws) => {
         break;
 
       case "signal":
-        // Relay WebRTC SDP offers/answers or ICE candidates directly to partner
-        if (ws.partner && ws.partner.readyState === ws.OPEN) {
-          ws.partner.send(JSON.stringify({
-            type: "signal",
-            data: msg.data
-          }));
+        // Route WebRTC offer/answer/ICE to the specific target peer in the room
+        if (ws.room && msg.data) {
+          const targetMeshId = msg.data.target_id;
+          const targetPeer = ws.room.players.find((p) => p.meshId === targetMeshId);
+          if (targetPeer && targetPeer.readyState === targetPeer.OPEN) {
+            targetPeer.send(JSON.stringify({
+              type: "signal",
+              data: {
+                ...msg.data,
+                from_id: ws.meshId
+              }
+            }));
+          }
         }
         break;
 
@@ -53,11 +61,17 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     console.log(`Player disconnected: ${ws.peerId}`);
-    waitingQueue = waitingQueue.filter((p) => p !== ws);
 
+    // 1. If they were in the matchmaking queue
+    const wasInQueue = waitingQueue.includes(ws);
+    waitingQueue = waitingQueue.filter((p) => p !== ws);
+    if (wasInQueue) {
+      _evaluateQueueState();
+    }
+
+    // 2. If they were in an active race room
     const room = ws.room;
     if (room) {
-      // If the player disconnected without an official finish time, mark them as DNF
       if (!room.results.has(ws.peerId)) {
         room.results.set(ws.peerId, {
           id: ws.peerId,
@@ -68,22 +82,22 @@ wss.on("connection", (ws) => {
           racing: false
         });
       } else {
-        const res = room.results.get(ws.peerId);
-        res.racing = false;
+        room.results.get(ws.peerId).racing = false;
       }
 
-      // Remove player from active socket list
       room.players = room.players.filter((p) => p !== ws);
 
-      // Notify partner/peers of the disconnection
-      if (ws.partner && ws.partner.readyState === ws.OPEN) {
-        ws.partner.send(JSON.stringify({ type: "partner_disconnected" }));
+      for (const peer of room.players) {
+        if (peer.readyState === peer.OPEN) {
+          peer.send(JSON.stringify({
+            type: "partner_disconnected",
+            meshId: ws.meshId
+          }));
+        }
       }
 
-      // Re-broadcast standings to remaining players so their boards stay accurate
       _broadcastRoomStandings(room);
 
-      // Clean up room memory once everyone has left
       if (room.players.length === 0) {
         rooms.delete(room.id);
         console.log(`Room ${room.id} cleaned up.`);
@@ -93,53 +107,114 @@ wss.on("connection", (ws) => {
 });
 
 function _handleQueue(ws) {
-  // Prevent duplicate queuing
   if (waitingQueue.includes(ws)) return;
+  waitingQueue.push(ws);
+  console.log(`Player ${ws.peerId} (${ws.playerName}) joined queue. Total waiting: ${waitingQueue.length}`);
+  _evaluateQueueState();
+}
 
-  if (waitingQueue.length > 0) {
-    // Match found! Pair with the waiting player
-    const host = waitingQueue.shift();
-    const client = ws;
+function _evaluateQueueState() {
+  // Clean out any closed sockets
+  waitingQueue = waitingQueue.filter((p) => p.readyState === p.OPEN);
 
-    const roomId = nextRoomId++;
-    const room = {
-      id: roomId,
-      players: [host, client],
-      results: new Map(), // peerId -> result object
-      finishPlaceCounter: 0
-    };
-    rooms.set(roomId, room);
+  // If 4+ players are waiting, launch a full 4-player match immediately!
+  if (waitingQueue.length >= 4) {
+    if (queueTimer) {
+      clearInterval(queueTimer);
+      queueTimer = null;
+    }
+    _launchMatchFromQueue();
+    return;
+  }
 
-    host.room = room;
-    client.room = room;
-
-    host.partner = client;
-    host.isHost = true;
-    client.partner = host;
-    client.isHost = false;
-
-    console.log(`Room ${roomId} created: Host (${host.peerId}) <---> Client (${client.peerId})`);
-
-    // Notify Host (acts as ID 1 in Godot WebRTC mesh)
-    host.send(JSON.stringify({
-      type: "match_found",
-      role: "host",
-      peerId: host.peerId,
-      roomId: roomId
-    }));
-
-    // Notify Client (acts as ID 2 in Godot WebRTC mesh)
-    client.send(JSON.stringify({
-      type: "match_found",
-      role: "client",
-      peerId: client.peerId,
-      roomId: roomId
-    }));
+  // If 2 or 3 players are waiting, start the 5-second countdown (if not already ticking)
+  if (waitingQueue.length >= 2) {
+    if (!queueTimer) {
+      queueCountdown = 5;
+      _broadcastQueueStatus();
+      queueTimer = setInterval(() => {
+        queueCountdown -= 1;
+        if (queueCountdown <= 0) {
+          clearInterval(queueTimer);
+          queueTimer = null;
+          _launchMatchFromQueue();
+        } else {
+          _broadcastQueueStatus();
+        }
+      }, 1000);
+    } else {
+      // Timer already running, just update everyone's player count
+      _broadcastQueueStatus();
+    }
   } else {
-    // Wait in queue
-    waitingQueue.push(ws);
-    console.log(`Player ${ws.peerId} entered matchmaking queue.`);
-    ws.send(JSON.stringify({ type: "queued" }));
+    // Fewer than 2 players waiting -> cancel countdown and wait
+    if (queueTimer) {
+      clearInterval(queueTimer);
+      queueTimer = null;
+    }
+    queueCountdown = 0;
+    _broadcastQueueStatus();
+  }
+}
+
+function _broadcastQueueStatus() {
+  const payload = JSON.stringify({
+    type: "queue_status",
+    count: waitingQueue.length,
+    countdown: queueCountdown
+  });
+  for (const ws of waitingQueue) {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(payload);
+    }
+  }
+}
+
+function _launchMatchFromQueue() {
+  if (waitingQueue.length < 2) {
+    _evaluateQueueState();
+    return;
+  }
+
+  // Take up to 4 players from the front of the queue
+  const matchedPlayers = waitingQueue.splice(0, 4);
+  const roomId = nextRoomId++;
+
+  const room = {
+    id: roomId,
+    players: matchedPlayers,
+    results: new Map(),
+    finishPlaceCounter: 0
+  };
+  rooms.set(roomId, room);
+
+  const meshIds = [];
+  matchedPlayers.forEach((ws, idx) => {
+    ws.room = room;
+    ws.meshId = idx + 1; // 1 = Host, 2, 3, 4 = Clients
+    ws.isHost = (ws.meshId === 1);
+    meshIds.push(ws.meshId);
+  });
+
+  console.log(`Room ${roomId} launching with ${matchedPlayers.length} players!`);
+
+  // Notify each matched player of their mesh ID and all peer mesh IDs in the room
+  for (const ws of matchedPlayers) {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({
+        type: "match_found",
+        role: ws.isHost ? "host" : "client",
+        meshId: ws.meshId,
+        peers: meshIds.filter((id) => id !== ws.meshId),
+        peerId: ws.peerId,
+        roomId: roomId
+      }));
+    }
+  }
+
+  // Re-evaluate queue in case more players are still waiting
+  if (waitingQueue.length > 0) {
+    _evaluateQueueState();
   }
 }
 
@@ -157,7 +232,6 @@ function _handleRaceFinish(ws, msg) {
     room.finishPlaceCounter += 1;
     assignedRank = room.finishPlaceCounter;
 
-    // Immediately inform this player of their official rank so confetti & UI can fire
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({
         type: "placement_announced",
@@ -175,22 +249,18 @@ function _handleRaceFinish(ws, msg) {
     racing: false
   });
 
-  console.log(`Room ${room.id}: Player ${ws.peerId} finished: ${finished} (Time: ${finishTime}s)`);
-
   _broadcastRoomStandings(room);
 }
 
 function _broadcastRoomStandings(room) {
   const standings = Array.from(room.results.values());
 
-  // Sort standings: Finished by lowest time first; Unfinished by highest score
   standings.sort((a, b) => {
     if (a.finished && b.finished) return a.time - b.time;
     if (a.finished !== b.finished) return a.finished ? -1 : 1;
     return b.score - a.score;
   });
 
-  // Append any players still actively racing
   for (const playerWs of room.players) {
     if (!room.results.has(playerWs.peerId)) {
       standings.push({
