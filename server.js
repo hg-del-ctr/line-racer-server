@@ -19,6 +19,7 @@ wss.on("connection", (ws) => {
   ws.room = null;
   ws.meshId = 0; // 1 = Host, 2..4 = Clients
   ws.playerName = `Player ${ws.peerId}`;
+  ws.skinId = "classic_red";
 
   console.log(`Player connected. Assigned Server ID: ${ws.peerId}`);
 
@@ -33,6 +34,7 @@ wss.on("connection", (ws) => {
     switch (msg.type) {
       case "queue":
         if (msg.name) ws.playerName = msg.name;
+        if (msg.skin_id) ws.skinId = msg.skin_id;
         _handleQueue(ws);
         break;
 
@@ -109,7 +111,15 @@ wss.on("connection", (ws) => {
 function _handleQueue(ws) {
   if (waitingQueue.includes(ws)) return;
   waitingQueue.push(ws);
-  console.log(`Player ${ws.peerId} (${ws.playerName}) joined queue. Total waiting: ${waitingQueue.length}`);
+  console.log(`Player ${ws.peerId} (${ws.playerName}, skin: ${ws.skinId}) joined queue. Total waiting: ${waitingQueue.length}`);
+  
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify({
+      type: "queued",
+      peerId: ws.peerId
+    }));
+  }
+
   _evaluateQueueState();
 }
 
@@ -117,7 +127,7 @@ function _evaluateQueueState() {
   // Clean out any closed sockets
   waitingQueue = waitingQueue.filter((p) => p.readyState === p.OPEN);
 
-  // If 4+ players are waiting, launch a full 4-player match immediately!
+  // If 4+ players are waiting, launch a full 4-player match immediately
   if (waitingQueue.length >= 4) {
     if (queueTimer) {
       clearInterval(queueTimer);
@@ -127,7 +137,7 @@ function _evaluateQueueState() {
     return;
   }
 
-  // If 2 or 3 players are waiting, start the 5-second countdown (if not already ticking)
+  // If 2 or 3 players are waiting, start the 5-second countdown
   if (waitingQueue.length >= 2) {
     if (!queueTimer) {
       queueCountdown = 5;
@@ -143,11 +153,9 @@ function _evaluateQueueState() {
         }
       }, 1000);
     } else {
-      // Timer already running, just update everyone's player count
       _broadcastQueueStatus();
     }
   } else {
-    // Fewer than 2 players waiting -> cancel countdown and wait
     if (queueTimer) {
       clearInterval(queueTimer);
       queueTimer = null;
@@ -158,11 +166,19 @@ function _evaluateQueueState() {
 }
 
 function _broadcastQueueStatus() {
+  const playersData = waitingQueue.map((ws) => ({
+    id: ws.peerId,
+    name: ws.playerName,
+    skin_id: ws.skinId || "classic_red"
+  }));
+
   const payload = JSON.stringify({
     type: "queue_status",
     count: waitingQueue.length,
-    countdown: queueCountdown
+    countdown: queueCountdown,
+    players: playersData
   });
+
   for (const ws of waitingQueue) {
     if (ws.readyState === ws.OPEN) {
       ws.send(payload);
@@ -176,7 +192,6 @@ function _launchMatchFromQueue() {
     return;
   }
 
-  // Take up to 4 players from the front of the queue
   const matchedPlayers = waitingQueue.splice(0, 4);
   const roomId = nextRoomId++;
 
@@ -198,7 +213,6 @@ function _launchMatchFromQueue() {
 
   console.log(`Room ${roomId} launching with ${matchedPlayers.length} players!`);
 
-  // Notify each matched player of their mesh ID and all peer mesh IDs in the room
   for (const ws of matchedPlayers) {
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({
@@ -212,7 +226,6 @@ function _launchMatchFromQueue() {
     }
   }
 
-  // Re-evaluate queue in case more players are still waiting
   if (waitingQueue.length > 0) {
     _evaluateQueueState();
   }
