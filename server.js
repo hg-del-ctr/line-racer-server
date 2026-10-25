@@ -1,8 +1,93 @@
 const { WebSocketServer } = require("ws");
+const Database = require("better-sqlite3");
+const path = require("path");
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port: PORT });
 
+// --- SQLite Database Initialization ---
+const dbPath = path.join(__dirname, "leaderboard.db");
+const db = new Database(dbPath);
+
+// Enable WAL mode for high concurrency
+db.pragma("journal_mode = WAL");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS players (
+    uuid TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    skin_id TEXT DEFAULT 'ball_red_small',
+    wins INTEGER DEFAULT 0,
+    updated_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_players_wins ON players(wins DESC);
+`);
+
+const upsertPlayerStmt = db.prepare(`
+  INSERT INTO players (uuid, name, skin_id, wins, updated_at)
+  VALUES (@uuid, @name, @skin_id, 0, @updated_at)
+  ON CONFLICT(uuid) DO UPDATE SET
+    name = excluded.name,
+    skin_id = excluded.skin_id,
+    updated_at = excluded.updated_at
+`);
+
+const recordWinStmt = db.prepare(`
+  INSERT INTO players (uuid, name, skin_id, wins, updated_at)
+  VALUES (@uuid, @name, @skin_id, 1, @updated_at)
+  ON CONFLICT(uuid) DO UPDATE SET
+    name = excluded.name,
+    skin_id = excluded.skin_id,
+    wins = players.wins + 1,
+    updated_at = excluded.updated_at
+`);
+
+const getTopLeaderboardStmt = db.prepare(`
+  SELECT uuid, name, skin_id, wins,
+         RANK() OVER (ORDER BY wins DESC, updated_at ASC) as rank
+  FROM players
+  WHERE wins > 0
+  ORDER BY wins DESC, updated_at ASC
+  LIMIT 50
+`);
+
+const getPlayerRankStmt = db.prepare(`
+  WITH ranked_players AS (
+    SELECT uuid, wins,
+           RANK() OVER (ORDER BY wins DESC, updated_at ASC) as rank
+    FROM players
+    WHERE wins > 0
+  )
+  SELECT rank, wins FROM ranked_players WHERE uuid = ?
+`);
+
+const getPlayerRawWinsStmt = db.prepare(`
+  SELECT wins FROM players WHERE uuid = ?
+`);
+
+function _dbGetPlayerStats(uuid) {
+  if (!uuid) return { rank: null, wins: 0 };
+  const ranked = getPlayerRankStmt.get(uuid);
+  if (ranked) {
+    return { rank: ranked.rank, wins: ranked.wins };
+  }
+  const raw = getPlayerRawWinsStmt.get(uuid);
+  return { rank: null, wins: raw ? raw.wins : 0 };
+}
+
+function _dbRecordPlayerWin(uuid, name, skinId) {
+  if (!uuid) return { rank: null, wins: 0 };
+  const now = Date.now();
+  recordWinStmt.run({
+    uuid: uuid,
+    name: name,
+    skin_id: skinId || "ball_red_small",
+    updated_at: now
+  });
+  return _dbGetPlayerStats(uuid);
+}
+
+// --- Server & Matchmaking State ---
 let waitingQueue = [];
 let queueTimer = null;
 let queueCountdown = 0;
@@ -11,17 +96,53 @@ let nextPeerId = 1;
 let nextRoomId = 1;
 
 const rooms = new Map();
+let onlineCountBroadcastTimeout = null;
 
-console.log(`Matchmaking & Signaling server running on port ${PORT}`);
+console.log(`Matchmaking, Signaling & Leaderboard server running on port ${PORT}`);
+
+// Broadcast online counter with 300ms debounce
+function _scheduleOnlineCountBroadcast() {
+  if (onlineCountBroadcastTimeout) return;
+  onlineCountBroadcastTimeout = setTimeout(() => {
+    onlineCountBroadcastTimeout = null;
+    _broadcastOnlineCount();
+  }, 300);
+}
+
+function _broadcastOnlineCount() {
+  const count = wss.clients.size;
+  const payload = JSON.stringify({
+    type: "online_count",
+    count: count
+  });
+
+  for (const client of wss.clients) {
+    if (client.readyState === client.OPEN) {
+      client.send(payload);
+    }
+  }
+}
 
 wss.on("connection", (ws) => {
   ws.peerId = nextPeerId++;
+  ws.playerUuid = null;
   ws.room = null;
   ws.meshId = 0; // 1 = Host, 2..4 = Clients
   ws.playerName = `Player ${ws.peerId}`;
-  ws.skinId = "classic_red";
+  ws.skinId = "ball_red_small";
+  ws.globalRank = null;
+  ws.wins = 0;
 
-  console.log(`Player connected. Assigned Server ID: ${ws.peerId}`);
+  console.log(`Player connected. Assigned Server ID: ${ws.peerId} (Total Online: ${wss.clients.size})`);
+
+  // Send immediate online count to the newcomer
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify({
+      type: "online_count",
+      count: wss.clients.size
+    }));
+  }
+  _scheduleOnlineCountBroadcast();
 
   ws.on("message", (rawMessage) => {
     let msg;
@@ -33,13 +154,46 @@ wss.on("connection", (ws) => {
 
     switch (msg.type) {
       case "queue":
-        if (msg.name) ws.playerName = msg.name;
-        if (msg.skin_id) ws.skinId = msg.skin_id;
+        if (msg.uuid) ws.playerUuid = String(msg.uuid);
+        if (msg.name) ws.playerName = String(msg.name);
+        if (msg.skin_id) ws.skinId = String(msg.skin_id);
+
+        if (ws.playerUuid) {
+          upsertPlayerStmt.run({
+            uuid: ws.playerUuid,
+            name: ws.playerName,
+            skin_id: ws.skinId,
+            updated_at: Date.now()
+          });
+          const stats = _dbGetPlayerStats(ws.playerUuid);
+          ws.globalRank = stats.rank;
+          ws.wins = stats.wins;
+        }
+
         _handleQueue(ws);
         break;
 
+      case "get_leaderboard": {
+        const top50 = getTopLeaderboardStmt.all();
+        const requesterUuid = msg.uuid || ws.playerUuid;
+        const requesterStats = _dbGetPlayerStats(requesterUuid);
+
+        if (ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({
+            type: "leaderboard_data",
+            top_players: top50,
+            player_stats: {
+              uuid: requesterUuid,
+              rank: requesterStats.rank,
+              wins: requesterStats.wins
+            }
+          }));
+        }
+        break;
+      }
+
       case "signal":
-        // Route WebRTC offer/answer/ICE to the specific target peer in the room
+        // Route WebRTC offer/answer/ICE candidates to target peer
         if (ws.room && msg.data) {
           const targetMeshId = msg.data.target_id;
           const targetPeer = ws.room.players.find((p) => p.meshId === targetMeshId);
@@ -62,22 +216,27 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    console.log(`Player disconnected: ${ws.peerId}`);
+    console.log(`Player disconnected: ${ws.peerId} (Remaining Online: ${wss.clients.size - 1})`);
+    _scheduleOnlineCountBroadcast();
 
-    // 1. If they were in the matchmaking queue
+    // 1. If in matchmaking queue
     const wasInQueue = waitingQueue.includes(ws);
     waitingQueue = waitingQueue.filter((p) => p !== ws);
     if (wasInQueue) {
       _evaluateQueueState();
     }
 
-    // 2. If they were in an active race room
+    // 2. If in active race room
     const room = ws.room;
     if (room) {
       if (!room.results.has(ws.peerId)) {
         room.results.set(ws.peerId, {
           id: ws.peerId,
+          uuid: ws.playerUuid,
           name: ws.playerName,
+          skin_id: ws.skinId,
+          global_rank: ws.globalRank,
+          wins: ws.wins,
           finished: false,
           time: 0.0,
           score: -100.0,
@@ -111,12 +270,13 @@ wss.on("connection", (ws) => {
 function _handleQueue(ws) {
   if (waitingQueue.includes(ws)) return;
   waitingQueue.push(ws);
-  console.log(`Player ${ws.peerId} (${ws.playerName}, skin: ${ws.skinId}) joined queue. Total waiting: ${waitingQueue.length}`);
-  
+  console.log(`Player ${ws.peerId} (${ws.playerName}, UUID: ${ws.playerUuid}, Rank: #${ws.globalRank ?? "Unranked"}) joined queue. Total waiting: ${waitingQueue.length}`);
+
   if (ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify({
       type: "queued",
-      peerId: ws.peerId
+      peerId: ws.peerId,
+      online_count: wss.clients.size
     }));
   }
 
@@ -124,10 +284,8 @@ function _handleQueue(ws) {
 }
 
 function _evaluateQueueState() {
-  // Clean out any closed sockets
   waitingQueue = waitingQueue.filter((p) => p.readyState === p.OPEN);
 
-  // If 4+ players are waiting, launch a full 4-player match immediately
   if (waitingQueue.length >= 4) {
     if (queueTimer) {
       clearInterval(queueTimer);
@@ -137,7 +295,6 @@ function _evaluateQueueState() {
     return;
   }
 
-  // If 2 or 3 players are waiting, start the 5-second countdown
   if (waitingQueue.length >= 2) {
     if (!queueTimer) {
       queueCountdown = 5;
@@ -168,13 +325,17 @@ function _evaluateQueueState() {
 function _broadcastQueueStatus() {
   const playersData = waitingQueue.map((ws) => ({
     id: ws.peerId,
+    uuid: ws.playerUuid,
     name: ws.playerName,
-    skin_id: ws.skinId || "classic_red"
+    skin_id: ws.skinId || "ball_red_small",
+    global_rank: ws.globalRank,
+    wins: ws.wins
   }));
 
   const payload = JSON.stringify({
     type: "queue_status",
     count: waitingQueue.length,
+    online_count: wss.clients.size,
     countdown: queueCountdown,
     players: playersData
   });
@@ -206,7 +367,7 @@ function _launchMatchFromQueue() {
   const meshIds = [];
   matchedPlayers.forEach((ws, idx) => {
     ws.room = room;
-    ws.meshId = idx + 1; // 1 = Host, 2, 3, 4 = Clients
+    ws.meshId = idx + 1; // 1 = Host, 2..4 = Clients
     ws.isHost = (ws.meshId === 1);
     meshIds.push(ws.meshId);
   });
@@ -245,17 +406,31 @@ function _handleRaceFinish(ws, msg) {
     room.finishPlaceCounter += 1;
     assignedRank = room.finishPlaceCounter;
 
+    // 1st place in multiplayer gets recorded in the global leaderboard
+    if (assignedRank === 1 && ws.playerUuid) {
+      const updated = _dbRecordPlayerWin(ws.playerUuid, playerName, ws.skinId);
+      ws.wins = updated.wins;
+      ws.globalRank = updated.rank;
+      console.log(`LEADERBOARD: 🏆 Winner ${playerName} (${ws.playerUuid}) earned win #${ws.wins}! Global Rank: #${ws.globalRank}`);
+    }
+
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({
         type: "placement_announced",
-        rank: assignedRank
+        rank: assignedRank,
+        global_rank: ws.globalRank,
+        wins: ws.wins
       }));
     }
   }
 
   room.results.set(ws.peerId, {
     id: ws.peerId,
+    uuid: ws.playerUuid,
     name: playerName,
+    skin_id: ws.skinId,
+    global_rank: ws.globalRank,
+    wins: ws.wins,
     finished: finished,
     time: finishTime,
     score: progressScore,
@@ -278,7 +453,11 @@ function _broadcastRoomStandings(room) {
     if (!room.results.has(playerWs.peerId)) {
       standings.push({
         id: playerWs.peerId,
+        uuid: playerWs.playerUuid,
         name: playerWs.playerName,
+        skin_id: playerWs.skinId,
+        global_rank: playerWs.globalRank,
+        wins: playerWs.wins,
         finished: false,
         time: 0.0,
         score: -1.0,
